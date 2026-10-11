@@ -1,0 +1,6 @@
+{
+  "name": "Team Aura Admin Panel",
+  "description": "Tournament management, notice broadcaster, user balances, and deposit/withdraw approval dashboard for Team Aura Esports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
