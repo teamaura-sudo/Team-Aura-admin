@@ -59,8 +59,8 @@ class DatabaseService {
   private useLocalMode = false;
 
   // Processed IDs tracker to guarantee approved/rejected items NEVER reappear as pending
-  private processedDeposits: Record<string, { status: RequestStatus; timestamp: number }> = {};
-  private processedWithdraws: Record<string, { status: RequestStatus; timestamp: number }> = {};
+  private processedDeposits: Record<string, { status: RequestStatus; timestamp: number; note?: string }> = {};
+  private processedWithdraws: Record<string, { status: RequestStatus; timestamp: number; note?: string }> = {};
 
   private state: LocalDBState = {
     settings: { ...INITIAL_SETTINGS },
@@ -197,25 +197,36 @@ class DatabaseService {
         if (val && typeof val === 'object') {
           const formatted: Record<string, DepositRequest> = {};
           for (const key of Object.keys(val)) {
-            const processed = this.processedDeposits[key];
             const serverRaw = val[key];
+            const processed = this.processedDeposits[key]
+              || (serverRaw?.id ? this.processedDeposits[serverRaw.id] : undefined)
+              || (serverRaw?.trx ? this.processedDeposits[serverRaw.trx] : undefined);
+
             const serverStatus = normalizeStatus(serverRaw?.status);
 
             // If locally processed, never allow it to revert to Pending
-            const effectiveStatus = processed 
+            const effectiveStatus: RequestStatus = processed 
               ? processed.status 
               : serverStatus;
 
+            const effectiveNote = (effectiveStatus === 'Rejected' && processed?.note)
+              ? processed.note
+              : (serverRaw?.note || '');
+
             formatted[key] = {
-              id: key,
               ...serverRaw,
+              id: key,
               status: effectiveStatus,
+              note: effectiveNote,
               amount: Number(serverRaw?.amount || 0)
             };
           }
           this.state = {
             ...this.state,
-            deposits: formatted
+            deposits: {
+              ...this.state.deposits,
+              ...formatted
+            }
           };
           this.isFirebaseAccessible = true;
           this.notify();
@@ -231,24 +242,35 @@ class DatabaseService {
         if (val && typeof val === 'object') {
           const formatted: Record<string, WithdrawRequest> = {};
           for (const key of Object.keys(val)) {
-            const processed = this.processedWithdraws[key];
             const serverRaw = val[key];
+            const processed = this.processedWithdraws[key]
+              || (serverRaw?.id ? this.processedWithdraws[serverRaw.id] : undefined)
+              || (serverRaw?.account ? this.processedWithdraws[serverRaw.account] : undefined);
+
             const serverStatus = normalizeStatus(serverRaw?.status);
 
-            const effectiveStatus = processed 
+            const effectiveStatus: RequestStatus = processed 
               ? processed.status 
               : serverStatus;
 
+            const effectiveNote = (effectiveStatus === 'Rejected' && processed?.note)
+              ? processed.note
+              : (serverRaw?.note || '');
+
             formatted[key] = {
-              id: key,
               ...serverRaw,
+              id: key,
               status: effectiveStatus,
+              note: effectiveNote,
               amount: Number(serverRaw?.amount || 0)
             };
           }
           this.state = {
             ...this.state,
-            withdraws: formatted
+            withdraws: {
+              ...this.state.withdraws,
+              ...formatted
+            }
           };
           this.isFirebaseAccessible = true;
           this.notify();
@@ -510,45 +532,61 @@ class DatabaseService {
   // --- DEPOSIT APPROVAL & REJECTION (IMMEDIATE DISAPPEARANCE GUARANTEED) ---
 
   public async approveDeposit(depositId: string, userId: string, amount: number): Promise<boolean> {
-    // Record as processed
-    this.processedDeposits[depositId] = {
-      status: 'Approved',
-      timestamp: Date.now()
-    };
+    const recordTimestamp = Date.now();
 
-    const existing = this.state.deposits[depositId];
-    const newDeposits = { ...this.state.deposits };
-
-    if (existing) {
-      newDeposits[depositId] = {
-        ...existing,
-        status: 'Approved',
-        reviewedAt: Date.now()
-      };
-    } else {
-      newDeposits[depositId] = {
-        id: depositId,
-        userId,
-        amount,
-        trx: depositId,
-        status: 'Approved',
-        reviewedAt: Date.now()
-      };
+    // 1. Locate existing record by dictionary key, d.id, or d.trx
+    let targetKey = depositId;
+    let existing = this.state.deposits[depositId];
+    if (!existing) {
+      for (const [k, d] of Object.entries(this.state.deposits)) {
+        if (d.id === depositId || (d.trx && d.trx === depositId)) {
+          targetKey = k;
+          existing = d;
+          break;
+        }
+      }
     }
 
-    const user = this.state.users[userId] || {
-      id: userId,
+    // 2. Mark processed across all key variations
+    this.processedDeposits[targetKey] = { status: 'Approved', timestamp: recordTimestamp };
+    this.processedDeposits[depositId] = { status: 'Approved', timestamp: recordTimestamp };
+    if (existing?.id) this.processedDeposits[existing.id] = { status: 'Approved', timestamp: recordTimestamp };
+    if (existing?.trx) this.processedDeposits[existing.trx] = { status: 'Approved', timestamp: recordTimestamp };
+
+    const actualUserId = existing?.userId || userId;
+    const actualAmount = Number(existing?.amount || amount || 0);
+
+    const updatedDeposit: DepositRequest = {
+      ...(existing || {}),
+      id: existing?.id || targetKey,
+      userId: actualUserId,
+      amount: actualAmount,
+      trx: existing?.trx || targetKey,
+      status: 'Approved',
+      reviewedAt: recordTimestamp
+    };
+
+    const newDeposits = {
+      ...this.state.deposits,
+      [targetKey]: updatedDeposit
+    };
+    if (depositId !== targetKey) {
+      newDeposits[depositId] = updatedDeposit;
+    }
+
+    const user = this.state.users[actualUserId] || {
+      id: actualUserId,
       balance: 0,
-      name: `Player_${userId.slice(-4)}`,
+      name: `Player_${actualUserId.slice(-4)}`,
       status: 'Active'
     };
 
     const newUsers = {
       ...this.state.users,
-      [userId]: {
+      [actualUserId]: {
         ...user,
-        balance: (user.balance || 0) + amount,
-        totalDeposited: (user.totalDeposited || 0) + amount
+        balance: (user.balance || 0) + actualAmount,
+        totalDeposited: (user.totalDeposited || 0) + actualAmount
       }
     };
 
@@ -562,20 +600,29 @@ class DatabaseService {
     // Firebase background sync: update status to Approved
     if (db && !this.useLocalMode) {
       withTimeout(
-        update(ref(db, `deposits/${depositId}`), {
+        update(ref(db, `deposits/${targetKey}`), {
           status: 'Approved',
-          reviewedAt: Date.now()
+          reviewedAt: recordTimestamp
         })
       ).catch(() => {});
 
+      if (depositId !== targetKey) {
+        withTimeout(
+          update(ref(db, `deposits/${depositId}`), {
+            status: 'Approved',
+            reviewedAt: recordTimestamp
+          })
+        ).catch(() => {});
+      }
+
       withTimeout(
-        runTransaction(ref(db, `users/${userId}/balance`), (currentBalance) => {
-          return (currentBalance || 0) + amount;
+        runTransaction(ref(db, `users/${actualUserId}/balance`), (currentBalance) => {
+          return (currentBalance || 0) + actualAmount;
         })
       ).catch(() => {
         try {
-          update(ref(db, `users/${userId}`), {
-            balance: newUsers[userId].balance
+          update(ref(db, `users/${actualUserId}`), {
+            balance: newUsers[actualUserId].balance
           });
         } catch {}
       });
@@ -584,31 +631,43 @@ class DatabaseService {
   }
 
   public async rejectDeposit(depositId: string, reason?: string): Promise<boolean> {
-    this.processedDeposits[depositId] = {
+    const finalReason = reason || 'Rejected by Admin';
+    const recordTimestamp = Date.now();
+
+    let targetKey = depositId;
+    let existing = this.state.deposits[depositId];
+    if (!existing) {
+      for (const [k, d] of Object.entries(this.state.deposits)) {
+        if (d.id === depositId || (d.trx && d.trx === depositId)) {
+          targetKey = k;
+          existing = d;
+          break;
+        }
+      }
+    }
+
+    this.processedDeposits[targetKey] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+    this.processedDeposits[depositId] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+    if (existing?.id) this.processedDeposits[existing.id] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+    if (existing?.trx) this.processedDeposits[existing.trx] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+
+    const updatedDeposit: DepositRequest = {
+      ...(existing || {}),
+      id: existing?.id || targetKey,
+      userId: existing?.userId || 'Unknown',
+      amount: Number(existing?.amount || 0),
+      trx: existing?.trx || targetKey,
       status: 'Rejected',
-      timestamp: Date.now()
+      note: finalReason,
+      reviewedAt: recordTimestamp
     };
 
-    const existing = this.state.deposits[depositId];
-    const newDeposits = { ...this.state.deposits };
-
-    if (existing) {
-      newDeposits[depositId] = {
-        ...existing,
-        status: 'Rejected',
-        note: reason || 'Rejected by Admin',
-        reviewedAt: Date.now()
-      };
-    } else {
-      newDeposits[depositId] = {
-        id: depositId,
-        userId: 'Unknown',
-        amount: 0,
-        trx: depositId,
-        status: 'Rejected',
-        note: reason || 'Rejected by Admin',
-        reviewedAt: Date.now()
-      };
+    const newDeposits = {
+      ...this.state.deposits,
+      [targetKey]: updatedDeposit
+    };
+    if (depositId !== targetKey) {
+      newDeposits[depositId] = updatedDeposit;
     }
 
     this.state = {
@@ -620,12 +679,22 @@ class DatabaseService {
     // Firebase background sync: update status to Rejected
     if (db && !this.useLocalMode) {
       withTimeout(
-        update(ref(db, `deposits/${depositId}`), {
+        update(ref(db, `deposits/${targetKey}`), {
           status: 'Rejected',
-          note: reason || 'Rejected by Admin',
-          reviewedAt: Date.now()
+          note: finalReason,
+          reviewedAt: recordTimestamp
         })
       ).catch(() => {});
+
+      if (depositId !== targetKey) {
+        withTimeout(
+          update(ref(db, `deposits/${depositId}`), {
+            status: 'Rejected',
+            note: finalReason,
+            reviewedAt: recordTimestamp
+          })
+        ).catch(() => {});
+      }
     }
     return true;
   }
@@ -680,6 +749,9 @@ class DatabaseService {
         newDeposits[id] = d;
       } else {
         toDeleteFirebase.push(id);
+        delete this.processedDeposits[id];
+        if (d.id) delete this.processedDeposits[d.id];
+        if (d.trx) delete this.processedDeposits[d.trx];
       }
     }
 
@@ -700,40 +772,53 @@ class DatabaseService {
   // --- WITHDRAWAL APPROVAL & REJECTION (EXACT SAME IMMEDIATE DISAPPEARANCE) ---
 
   public async approveWithdraw(withdrawId: string, userId: string, amount: number): Promise<{ success: boolean; error?: string }> {
-    this.processedWithdraws[withdrawId] = {
-      status: 'Approved',
-      timestamp: Date.now()
-    };
-
-    const existing = this.state.withdraws[withdrawId];
-    const newWithdraws = { ...this.state.withdraws };
-
-    if (existing) {
-      newWithdraws[withdrawId] = {
-        ...existing,
-        status: 'Approved',
-        reviewedAt: Date.now()
-      };
-    } else {
-      newWithdraws[withdrawId] = {
-        id: withdrawId,
-        userId,
-        amount,
-        account: 'User Account',
-        status: 'Approved',
-        reviewedAt: Date.now()
-      };
+    const recordTimestamp = Date.now();
+    let targetKey = withdrawId;
+    let existing = this.state.withdraws[withdrawId];
+    if (!existing) {
+      for (const [k, w] of Object.entries(this.state.withdraws)) {
+        if (w.id === withdrawId || (w.account && w.account === withdrawId)) {
+          targetKey = k;
+          existing = w;
+          break;
+        }
+      }
     }
 
-    const user = this.state.users[userId];
+    this.processedWithdraws[targetKey] = { status: 'Approved', timestamp: recordTimestamp };
+    this.processedWithdraws[withdrawId] = { status: 'Approved', timestamp: recordTimestamp };
+    if (existing?.id) this.processedWithdraws[existing.id] = { status: 'Approved', timestamp: recordTimestamp };
+
+    const actualUserId = existing?.userId || userId;
+    const actualAmount = Number(existing?.amount || amount || 0);
+
+    const updatedWithdraw: WithdrawRequest = {
+      ...(existing || {}),
+      id: existing?.id || targetKey,
+      userId: actualUserId,
+      amount: actualAmount,
+      account: existing?.account || 'User Account',
+      status: 'Approved',
+      reviewedAt: recordTimestamp
+    };
+
+    const newWithdraws = {
+      ...this.state.withdraws,
+      [targetKey]: updatedWithdraw
+    };
+    if (withdrawId !== targetKey) {
+      newWithdraws[withdrawId] = updatedWithdraw;
+    }
+
+    const user = this.state.users[actualUserId];
     let newUsers = this.state.users;
     if (user) {
       newUsers = {
         ...this.state.users,
-        [userId]: {
+        [actualUserId]: {
           ...user,
-          balance: Math.max(0, (user.balance || 0) - amount),
-          totalWithdrawn: (user.totalWithdrawn || 0) + amount
+          balance: Math.max(0, (user.balance || 0) - actualAmount),
+          totalWithdrawn: (user.totalWithdrawn || 0) + actualAmount
         }
       };
     }
@@ -748,36 +833,59 @@ class DatabaseService {
     // Firebase background sync: update status to Approved
     if (db && !this.useLocalMode) {
       withTimeout(
-        update(ref(db, `withdraws/${withdrawId}`), {
+        update(ref(db, `withdraws/${targetKey}`), {
           status: 'Approved',
-          reviewedAt: Date.now()
+          reviewedAt: recordTimestamp
         })
       ).catch(() => {});
 
-      withTimeout(
-        runTransaction(ref(db, `users/${userId}/balance`), (currentBalance) => {
-          return Math.max(0, (currentBalance || 0) - amount);
-        })
-      ).catch(() => {
-        if (user) {
+      if (withdrawId !== targetKey) {
+        withTimeout(
+          update(ref(db, `withdraws/${withdrawId}`), {
+            status: 'Approved',
+            reviewedAt: recordTimestamp
+          })
+        ).catch(() => {});
+      }
+
+      if (user) {
+        withTimeout(
+          runTransaction(ref(db, `users/${actualUserId}/balance`), (currentBalance) => {
+            return Math.max(0, (currentBalance || 0) - actualAmount);
+          })
+        ).catch(() => {
           try {
-            update(ref(db, `users/${userId}`), { balance: newUsers[userId].balance });
+            update(ref(db, `users/${actualUserId}`), { balance: newUsers[actualUserId].balance });
           } catch {}
-        }
-      });
+        });
+      }
     }
 
     return { success: true };
   }
 
   public async rejectWithdraw(withdrawId: string, reason?: string, refundUser: boolean = true): Promise<boolean> {
-    this.processedWithdraws[withdrawId] = {
-      status: 'Rejected',
-      timestamp: Date.now()
-    };
+    const finalReason = reason || 'Rejected by Admin';
+    const recordTimestamp = Date.now();
 
-    const existing = this.state.withdraws[withdrawId];
-    const newWithdraws = { ...this.state.withdraws };
+    let targetKey = withdrawId;
+    let existing = this.state.withdraws[withdrawId];
+    if (!existing) {
+      for (const [k, w] of Object.entries(this.state.withdraws)) {
+        if (w.id === withdrawId || (w.account && w.account === withdrawId)) {
+          targetKey = k;
+          existing = w;
+          break;
+        }
+      }
+    }
+
+    this.processedWithdraws[targetKey] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+    this.processedWithdraws[withdrawId] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+    if (existing?.id) this.processedWithdraws[existing.id] = { status: 'Rejected', timestamp: recordTimestamp, note: finalReason };
+
+    const actualUserId = existing?.userId || 'Unknown';
+    const actualAmount = Number(existing?.amount || 0);
 
     let newUsers = this.state.users;
     if (existing && refundUser && existing.userId && this.state.users[existing.userId]) {
@@ -786,28 +894,28 @@ class DatabaseService {
         ...this.state.users,
         [existing.userId]: {
           ...user,
-          balance: (user.balance || 0) + Number(existing.amount)
+          balance: (user.balance || 0) + actualAmount
         }
       };
     }
 
-    if (existing) {
-      newWithdraws[withdrawId] = {
-        ...existing,
-        status: 'Rejected',
-        note: reason || 'Rejected by Admin',
-        reviewedAt: Date.now()
-      };
-    } else {
-      newWithdraws[withdrawId] = {
-        id: withdrawId,
-        userId: 'Unknown',
-        amount: 0,
-        account: 'User Account',
-        status: 'Rejected',
-        note: reason || 'Rejected by Admin',
-        reviewedAt: Date.now()
-      };
+    const updatedWithdraw: WithdrawRequest = {
+      ...(existing || {}),
+      id: existing?.id || targetKey,
+      userId: actualUserId,
+      amount: actualAmount,
+      account: existing?.account || 'User Account',
+      status: 'Rejected',
+      note: finalReason,
+      reviewedAt: recordTimestamp
+    };
+
+    const newWithdraws = {
+      ...this.state.withdraws,
+      [targetKey]: updatedWithdraw
+    };
+    if (withdrawId !== targetKey) {
+      newWithdraws[withdrawId] = updatedWithdraw;
     }
 
     this.state = {
@@ -820,17 +928,31 @@ class DatabaseService {
     // Firebase background sync: update status to Rejected
     if (db && !this.useLocalMode) {
       withTimeout(
-        update(ref(db, `withdraws/${withdrawId}`), {
+        update(ref(db, `withdraws/${targetKey}`), {
           status: 'Rejected',
-          note: reason || 'Rejected by Admin',
-          reviewedAt: Date.now()
+          note: finalReason,
+          reviewedAt: recordTimestamp
         })
       ).catch(() => {});
 
+      if (withdrawId !== targetKey) {
+        withTimeout(
+          update(ref(db, `withdraws/${withdrawId}`), {
+            status: 'Rejected',
+            note: finalReason,
+            reviewedAt: recordTimestamp
+          })
+        ).catch(() => {});
+      }
+
       if (refundUser && existing?.userId) {
         withTimeout(
-          runTransaction(ref(db, `users/${existing.userId}/balance`), (curr) => (curr || 0) + Number(existing.amount))
-        ).catch(() => {});
+          runTransaction(ref(db, `users/${existing.userId}/balance`), (curr) => (curr || 0) + actualAmount)
+        ).catch(() => {
+          try {
+            update(ref(db, `users/${existing.userId}`), { balance: newUsers[existing.userId].balance });
+          } catch {}
+        });
       }
     }
     return true;
@@ -884,6 +1006,8 @@ class DatabaseService {
         newWithdraws[id] = w;
       } else {
         toDeleteFirebase.push(id);
+        delete this.processedWithdraws[id];
+        if (w.id) delete this.processedWithdraws[w.id];
       }
     }
 
